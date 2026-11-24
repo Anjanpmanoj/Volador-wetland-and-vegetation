@@ -7,6 +7,9 @@ Run from any working directory:
     .\.venv\Scripts\python.exe environment.py --check --deep-model
     python environment.py --fix-model     # repair only known generated demo ONNX model
     python environment.py --self-test     # built-in regression tests
+    .\.venv\Scripts\python.exe environment.py --readiness   # is each saved project ready to analyse?
+    .\.venv\Scripts\python.exe environment.py --run-tests   # run the existing backend pytest suite
+    .\.venv\Scripts\python.exe environment.py --verify      # check + readiness + tests in one command
 
 Path migration is intentionally restricted to the known per-project paths.
 An original backup of projects.json is created before writing any changes.
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import importlib.util
 import json
 import os
 import re
@@ -26,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 import venv
@@ -86,7 +91,11 @@ def read_projects(root: Path, report: Report) -> dict | None:
         report.add("WARN", "No saved projects.json; nothing to migrate or validate")
         return None
     try:
-        records = json.loads(path.read_text(encoding="utf-8-sig"))
+        text = path.read_text(encoding="utf-8-sig")
+        if not text.strip():
+            report.add("FAIL", "projects.json is empty (expected a JSON object such as {})")
+            return None
+        records = json.loads(text)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         report.add("FAIL", f"Cannot read projects.json: {exc}")
         return None
@@ -332,6 +341,235 @@ def check_projects(root: Path, report: Report) -> None:
             report.add("WARN", f"{project_id}: configured boundary file missing")
 
 
+# --------------------------------------------------------------------------
+# Project readiness: can each saved project start a vegetation / wetland run?
+# --------------------------------------------------------------------------
+# Rules mirror the existing dataset validation tests: vegetation mode needs the
+# four bands at T1; wetland mode needs the four bands at T1 and T2. The wetland
+# boundary is optional in both modes.
+MODES = {"vegetation": ("t1",), "wetland": ("t1", "t2")}
+GEOJSON_AREA_TYPES = ("Polygon", "MultiPolygon")
+
+
+def find_band_file(folder: Path, band: str) -> Path | None:
+    """Case-insensitive lookup, so scene_R.TIF and scene_R.tiff are also found."""
+    if not folder.is_dir():
+        return None
+    stem = Path(band).stem.casefold()
+    wanted = {f"{stem}.tif", f"{stem}.tiff"}
+    try:
+        for item in sorted(folder.iterdir()):
+            if item.is_file() and item.name.casefold() in wanted:
+                return item
+    except OSError:
+        return None
+    return None
+
+
+def inspect_band(path: Path) -> dict:
+    """Describe one band file. A 'problem' blocks analysis; 'georeferenced' is advisory.
+
+    Drone imagery without a CRS is accepted by the backend, so a missing CRS is
+    reported as a note and never blocks readiness.
+    """
+    import rasterio
+    from rasterio.errors import NotGeoreferencedWarning
+
+    info = {"problem": None, "georeferenced": True, "size": None, "grid": None}
+    try:
+        if path.stat().st_size == 0:
+            info["problem"] = "file is empty (0 bytes)"
+            return info
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", NotGeoreferencedWarning)
+            with rasterio.open(path) as src:
+                if src.count < 1 or src.width < 1 or src.height < 1:
+                    info["problem"] = "raster has no pixels"
+                    return info
+                info["size"] = (src.width, src.height)
+                info["grid"] = (str(src.crs), tuple(src.transform))
+                info["georeferenced"] = src.crs is not None and not src.transform.is_identity
+                sample = src.read(1, masked=True,
+                                  out_shape=(min(64, src.height), min(64, src.width)))
+                if sample.count() == 0:
+                    info["problem"] = "no valid pixels (all NoData)"
+    except Exception as exc:  # rasterio raises several error types for bad files
+        text = (str(exc).splitlines() or [type(exc).__name__])[0].replace(str(path), path.name)
+        reason = "not a valid GeoTIFF" if "not recognized" in text else text[:90]
+        info["problem"] = f"cannot be read as a raster ({reason})"
+    return info
+
+
+def inspect_date_folder(folder: Path) -> dict:
+    """Inspect the four band files of one acquisition date."""
+    result = {"folder_exists": folder.is_dir(), "missing": [], "problems": [],
+              "notes": [], "size": None, "grid": None}
+    if not result["folder_exists"]:
+        result["missing"] = list(BANDS)
+        return result
+    readable = {}
+    not_georeferenced = []
+    for band in BANDS:
+        path = find_band_file(folder, band)
+        if path is None:
+            result["missing"].append(band)
+            continue
+        info = inspect_band(path)
+        if info["problem"]:
+            result["problems"].append(f"{band}: {info['problem']}")
+        if info["size"] is not None:
+            readable[band] = info
+            if not info["georeferenced"]:
+                not_georeferenced.append(band)
+    if not_georeferenced:
+        result["notes"].append("no georeferencing (CRS/transform) in " + ", ".join(not_georeferenced))
+    sizes = {info["size"] for info in readable.values()}
+    if len(sizes) > 1:
+        detail = ", ".join(f"{band} {info['size'][0]}x{info['size'][1]}"
+                           for band, info in readable.items())
+        result["problems"].append(f"band dimensions differ ({detail})")
+    elif readable:
+        first = next(iter(readable.values()))
+        result["size"] = first["size"]
+        result["grid"] = first["grid"]
+        if len({info["grid"] for info in readable.values()}) > 1:
+            result["notes"].append("bands use different CRS/transform values")
+    return result
+
+
+def evaluate_project(root: Path, project_id: str, project: dict) -> dict:
+    """Return per-mode blocking reasons (empty list = READY) and advisory notes."""
+    dates = {date: inspect_date_folder(project_dataset_dir(root, project_id, date))
+             for date in ("t1", "t2")}
+    verdicts = {}
+    for mode, needed in MODES.items():
+        reasons = []
+        for date in needed:
+            found, label = dates[date], date.upper()
+            if not found["folder_exists"]:
+                reasons.append(f"{label} dataset folder missing")
+            elif len(found["missing"]) == len(BANDS):
+                reasons.append(f"{label} has no band files")
+            elif found["missing"]:
+                reasons.append(f"{label} missing {', '.join(found['missing'])}")
+            reasons.extend(f"{label} {problem}" for problem in found["problems"])
+        verdicts[mode] = reasons
+    notes = [f"{date.upper()} {note}" for date in dates for note in dates[date]["notes"]]
+    t1, t2 = dates["t1"], dates["t2"]
+    if t1["size"] and t2["size"] and t1["size"] != t2["size"]:
+        notes.append(f"T1 and T2 dimensions differ ({t1['size'][0]}x{t1['size'][1]} vs "
+                     f"{t2['size'][0]}x{t2['size'][1]}); the engine must align them")
+    elif t1["grid"] and t2["grid"] and t1["grid"] != t2["grid"]:
+        notes.append("T1 and T2 use different CRS/transform values; alignment is needed")
+    mode = project.get("analysis_mode")
+    return {"id": project_id, "mode": mode if mode in MODES else None,
+            "raw_mode": mode, "verdicts": verdicts, "notes": notes}
+
+
+def project_ready(result: dict) -> bool:
+    """Ready for the configured mode, or for any mode when none is configured."""
+    if result["mode"]:
+        return not result["verdicts"][result["mode"]]
+    return any(not reasons for reasons in result["verdicts"].values())
+
+
+def check_boundary_file(path_text: str) -> str | None:
+    """Return a problem for a configured wetland boundary file, or None if usable."""
+    path = Path(path_text)
+    if not path.is_file():
+        return "file not found"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return f"not valid GeoJSON ({type(exc).__name__})"
+    if not isinstance(data, dict):
+        return "not a GeoJSON object"
+    kind = data.get("type")
+    if kind == "FeatureCollection":
+        geometries = [item.get("geometry") for item in data.get("features", [])
+                      if isinstance(item, dict)]
+    elif kind == "Feature":
+        geometries = [data.get("geometry")]
+    else:
+        geometries = [data]
+    if not any(isinstance(geometry, dict) and geometry.get("type") in GEOJSON_AREA_TYPES
+               and geometry.get("coordinates") for geometry in geometries):
+        return "contains no Polygon or MultiPolygon"
+    return None
+
+
+def find_orphan_projects(root: Path, records: dict) -> list[str]:
+    """Upload folders on disk that have no entry in projects.json."""
+    base = storage_dir(root) / "projects"
+    if not base.is_dir():
+        return []
+    try:
+        return sorted(item.name for item in base.iterdir()
+                      if item.is_dir() and item.name not in records)
+    except OSError:
+        return []
+
+
+def check_readiness(root: Path, report: Report, only: str | None = None) -> list[dict]:
+    """Add a READY / NOT READY verdict per saved project to the report."""
+    records = read_projects(root, report)
+    if records is None:
+        return []
+    try:
+        import rasterio  # noqa: F401
+    except ImportError:
+        report.add("FAIL", "rasterio is missing; cannot assess project readiness")
+        return []
+    if not records:
+        report.add("PASS", "No saved projects to assess")
+    results = []
+    for project_id, project in records.items():
+        if only and project_id != only:
+            continue
+        result = evaluate_project(root, project_id, project)
+        results.append(result)
+        if result["mode"] is None and result["raw_mode"] not in (None, ""):
+            report.add("WARN", f"{project_id}: unknown analysis_mode {result['raw_mode']!r}; "
+                               "assessing both modes")
+        modes = [result["mode"]] if result["mode"] else list(MODES)
+        for mode in modes:
+            reasons = result["verdicts"][mode]
+            if reasons:
+                report.add("WARN", f"{project_id}: NOT READY for {mode} mode - " + "; ".join(reasons))
+            else:
+                report.add("PASS", f"{project_id}: READY for {mode} mode")
+        if result["mode"]:
+            for other in MODES:
+                if other != result["mode"] and not result["verdicts"][other]:
+                    report.add("PASS", f"{project_id}: also ready for {other} mode")
+        for note in result["notes"]:
+            report.add("WARN", f"{project_id}: {note}")
+        boundary = project.get("wetland_boundary")
+        if isinstance(boundary, str) and boundary:
+            problem = check_boundary_file(boundary)
+            if problem:
+                report.add("WARN", f"{project_id}: wetland boundary {problem} (boundary is optional)")
+    if only and not results:
+        report.add("FAIL", f"Project {only!r} not found in projects.json")
+    if not only:
+        for name in find_orphan_projects(root, records):
+            report.add("WARN", f"Upload folder without a saved project: projects/{name}")
+    return results
+
+
+def run_readiness(root: Path, only: str | None = None, strict: bool = False,
+                  quiet: bool = False) -> int:
+    report = Report(quiet=quiet)
+    results = check_readiness(root, report, only)
+    healthy = report.summary()
+    ready = sum(1 for result in results if project_ready(result))
+    if not quiet and results:
+        print(f"Projects ready: {ready} of {len(results)}")
+    if not healthy:
+        return 1
+    return 1 if strict and ready < len(results) else 0
+
+
 def model_path(root: Path) -> Path:
     return root / "backend" / "Engine_module" / "models" / "best_finetuned_model.onnx"
 
@@ -520,13 +758,156 @@ def run_check(deep: bool) -> int:
     return 0 if report.summary() else 1
 
 
-def setup() -> int:
+# --------------------------------------------------------------------------
+# Existing test suites and one-command verification
+# --------------------------------------------------------------------------
+PYTEST_COUNT = re.compile(r"(\d+)\s+(passed|failed|skipped|errors?|xfailed|xpassed|deselected)\b")
+
+
+def summarize_pytest_output(text: str) -> dict:
+    """Extract result counts and failed test ids from pytest's -q output."""
+    counts: dict[str, int] = {}
+    for line in reversed(text.strip().splitlines()):
+        found = PYTEST_COUNT.findall(line)
+        if found and " in " in line:
+            for number, name in found:
+                counts["error" if name.startswith("error") else name] = int(number)
+            break
+    failed = [line.split(" - ")[0].strip() for line in text.splitlines()
+              if line.startswith(("FAILED ", "ERROR "))]
+    return {"counts": counts, "failed": failed}
+
+
+def run_pytest_suite(label: str, args: list[str], cwd: Path, report: Report,
+                     timeout: int) -> bool:
+    if importlib.util.find_spec("pytest") is None:
+        report.add("FAIL", f"{label}: pytest is not installed. Run pip install -r requirements.txt")
+        return False
+    # -p no:cacheprovider keeps .pytest_cache out of the repository.
+    command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args]
+    environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout,
+                              env=environment, check=False)
+    except subprocess.TimeoutExpired:
+        report.add("FAIL", f"{label}: timed out after {timeout}s (raise --test-timeout)")
+        return False
+    except OSError as exc:
+        report.add("FAIL", f"{label}: could not start pytest: {exc}")
+        return False
+    elapsed = time.monotonic() - started
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    summary = summarize_pytest_output(output)
+    text = ", ".join(f"{number} {name}" for name, number in summary["counts"].items()) or "no summary line"
+    if proc.returncode == 0:
+        report.add("PASS", f"{label}: {text} ({elapsed:.0f}s)")
+        return True
+    if proc.returncode == 5:
+        report.add("WARN", f"{label}: no tests were collected")
+        return True
+    report.add("FAIL", f"{label}: {text} ({elapsed:.0f}s)")
+    if not report.quiet:
+        for name in summary["failed"][:10]:
+            print(f"       {name}")
+        if not summary["failed"]:
+            print("       " + "\n       ".join(output.strip().splitlines()[-10:]))
+    return False
+
+
+def run_tests(root: Path, include_engine: bool = False, timeout: int = 1200,
+              quiet: bool = False) -> int:
+    """Run the repository's existing pytest suites with this interpreter."""
+    report = Report(quiet=quiet)
+    backend_tests = root / "backend" / "tests"
+    if backend_tests.is_dir():
+        run_pytest_suite("backend tests", [str(backend_tests)], root, report, timeout)
+    else:
+        report.add("FAIL", "backend/tests not found")
+    if include_engine:
+        engine = root / "backend" / "Engine_module"
+        if engine.is_dir():
+            run_pytest_suite("engine tests", [], engine, report, timeout)
+        else:
+            report.add("FAIL", "backend/Engine_module not found")
+    return 0 if report.summary() else 1
+
+
+def run_verify(include_engine: bool, timeout: int) -> int:
+    """One command: environment check, project readiness and the existing tests."""
+    print("\n### 1/3 Environment and ONNX check ###")
+    environment_code = run_check(deep=True)
+    print("\n### 2/3 Project readiness ###")
+    readiness_code = run_readiness(ROOT)
+    print("\n### 3/3 Existing test suites ###")
+    tests_code = run_tests(ROOT, include_engine, timeout)
+    print("\n" + "=" * 52)
+    print("VERIFY SUMMARY")
+    print("=" * 52)
+    for label, code in (("Environment check", environment_code),
+                        ("Project readiness", readiness_code),
+                        ("Existing tests", tests_code)):
+        print(f"{label:20}: {'OK' if code == 0 else 'FAILED'}")
+    return 0 if environment_code == readiness_code == tests_code == 0 else 1
+
+
+def venv_python_version(venv_path: Path) -> tuple[int, int] | None:
+    """Python (major, minor) a virtual environment was built with, from pyvenv.cfg."""
+    try:
+        text = (venv_path / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"^version(?:_info)?\s*=\s*(\d+)\.(\d+)", text, re.MULTILINE)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def prepare_venv(report: Report, recreate: bool) -> bool:
+    """Detect a stale virtual environment; delete it only on request."""
+    if not VENV.exists():
+        return True
+    is_venv = (VENV / "pyvenv.cfg").is_file()
+    version = venv_python_version(VENV)
+    stale = version is not None and not python_supported(version)
+    interpreter = VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    broken = is_venv and not interpreter.is_file()
+    if not (recreate or stale or broken):
+        return True
+    if not is_venv:
+        report.add("FAIL", f"{VENV} exists but is not a virtual environment; refusing to delete it")
+        return False
+    if not recreate:
+        reason = (f"uses unsupported Python {version[0]}.{version[1]}" if stale
+                  else "has no Python interpreter (was the folder moved?)")
+        report.add("FAIL", f"The existing .venv {reason}. "
+                           "Re-run with: py -3.11 environment.py --setup --recreate")
+        return False
+    try:
+        shutil.rmtree(VENV)
+    except OSError as exc:
+        report.add("FAIL", f"Could not remove the old .venv (is it in use?): {exc}")
+        return False
+    report.add("PASS", "Removed the old virtual environment; a new one will be created")
+    return True
+
+
+def setup(recreate: bool = False) -> int:
     report = Report()
     if not python_supported(sys.version_info):
-        report.add("FAIL", "Please run with Python 3.11-3.13")
+        report.add("FAIL", f"Python {sys.version.split()[0]} is not supported (need 3.11-3.13). "
+                           "Re-run with a supported interpreter, e.g. py -3.11 environment.py --setup")
+        report.summary()
         return 1
     check_layout(ROOT, report)
     if report.counts["FAIL"]:
+        report.summary()
+        return 1
+    if not REQUIREMENTS.is_file():
+        report.add("FAIL", "requirements.txt missing")
+        report.summary()
+        return 1
+    # Check the virtual environment first: failing here must not change any files.
+    if not prepare_venv(report, recreate):
         report.summary()
         return 1
     try:
@@ -536,10 +917,6 @@ def setup() -> int:
         report.summary()
         return 1
     if not fix_project_paths(ROOT, report):
-        report.summary()
-        return 1
-    if not REQUIREMENTS.is_file():
-        report.add("FAIL", "requirements.txt missing")
         report.summary()
         return 1
     try:
@@ -563,8 +940,15 @@ def setup() -> int:
         report.add("PASS", "ONNX model compatibility checked / known demo repaired")
         report.summary()
         print(f"\nNext: {python} environment.py --check --deep-model")
+        print(f"Then: {python} environment.py --readiness")
         return 0
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except subprocess.CalledProcessError as exc:
+        report.add("FAIL", f"Dependency installation failed (pip exit code {exc.returncode}). "
+                           "Check the internet connection or proxy and the pip output above, "
+                           "then re-run --setup")
+        report.summary()
+        return 1
+    except (OSError, RuntimeError) as exc:
         report.add("FAIL", f"Environment setup failed: {exc}")
         report.summary()
         return 1
@@ -735,6 +1119,262 @@ class SelfTests(unittest.TestCase):
                 self.assertGreater(report.counts["FAIL"], 0)
 
 
+    # ------------------------------------------------------------------
+    # Update 2: readiness, raster consistency, test runner, venv, edge cases
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _write_tif(path: Path, size=(16, 16), georeferenced=True, fill=0.5,
+                   nodata=-9999.0) -> Path:
+        import numpy as np
+        import rasterio
+        from rasterio.transform import Affine, from_origin
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        transform = from_origin(500000, 1100000, 10, 10) if georeferenced else Affine.identity()
+        profile = {"driver": "GTiff", "height": size[1], "width": size[0], "count": 1,
+                   "dtype": "float32", "transform": transform, "nodata": nodata}
+        if georeferenced:
+            profile["crs"] = "EPSG:32643"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with rasterio.open(path, "w", **profile) as dst:
+                dst.write(np.full((size[1], size[0]), fill, dtype="float32"), 1)
+        return path
+
+    def _populate(self, root: Path, project_id: str, date: str, bands=BANDS, **kwargs):
+        folder = project_dataset_dir(root, project_id, date)
+        for band in bands:
+            self._write_tif(folder / band, **kwargs)
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _require_rasterio(self):
+        try:
+            import numpy  # noqa: F401
+            import rasterio  # noqa: F401
+        except ImportError:
+            self.skipTest("rasterio and numpy not installed")
+
+    def test_band_lookup_is_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "SCENE_R.TIF").write_bytes(b"x")
+            (folder / "scene_g.tiff").write_bytes(b"x")
+            self.assertEqual(find_band_file(folder, "scene_R.tif").name, "SCENE_R.TIF")
+            self.assertEqual(find_band_file(folder, "scene_G.tif").name, "scene_g.tiff")
+            self.assertIsNone(find_band_file(folder, "scene_NIR.tif"))
+            self.assertIsNone(find_band_file(folder / "missing", "scene_R.tif"))
+
+    def test_empty_projects_file_is_reported_and_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = projects_file(root)
+            config.parent.mkdir(parents=True)
+            config.write_text("  \n", encoding="utf-8")
+            report = Report(quiet=True)
+            self.assertIsNone(read_projects(root, report))
+            self.assertEqual(report.counts["FAIL"], 1)
+            self.assertEqual(config.read_text(encoding="utf-8"), "  \n")
+
+    def test_paths_with_spaces_are_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Anjan P Manoj" / "Volador wetland PR"
+            config = projects_file(root)
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"prj_1": {}}), encoding="utf-8")
+            self.assertTrue(fix_project_paths(root, Report(quiet=True)))
+            self.assertTrue(project_dataset_dir(root, "prj_1", "t1").is_dir())
+            self.assertIn("Anjan P Manoj", json.loads(config.read_text(encoding="utf-8"))["prj_1"]["t1_dir"])
+
+    def test_venv_version_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            venv_dir = Path(tmp)
+            self.assertIsNone(venv_python_version(venv_dir))
+            (venv_dir / "pyvenv.cfg").write_text("home = x\nversion = 3.10.4\n", encoding="utf-8")
+            self.assertEqual(venv_python_version(venv_dir), (3, 10))
+            self.assertFalse(python_supported(venv_python_version(venv_dir)))
+            (venv_dir / "pyvenv.cfg").write_text("version_info = 3.11.9.final.0\n", encoding="utf-8")
+            self.assertEqual(venv_python_version(venv_dir), (3, 11))
+
+    def test_stale_venv_requires_explicit_recreate(self):
+        global VENV
+        original = VENV
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                VENV = Path(tmp) / ".venv"
+                VENV.mkdir()
+                (VENV / "pyvenv.cfg").write_text("version = 3.9.1\n", encoding="utf-8")
+                report = Report(quiet=True)
+                self.assertFalse(prepare_venv(report, recreate=False))
+                self.assertTrue(VENV.exists())
+                self.assertEqual(report.counts["FAIL"], 1)
+                self.assertTrue(prepare_venv(Report(quiet=True), recreate=True))
+                self.assertFalse(VENV.exists())
+                VENV.mkdir()  # not a venv: never deleted
+                self.assertFalse(prepare_venv(Report(quiet=True), recreate=True))
+                self.assertTrue(VENV.exists())
+            finally:
+                VENV = original
+
+    def test_boundary_file_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            good = folder / "good.geojson"
+            good.write_text(json.dumps({"type": "FeatureCollection", "features": [{
+                "type": "Feature", "properties": {},
+                "geometry": {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]]}}]}),
+                encoding="utf-8")
+            self.assertIsNone(check_boundary_file(str(good)))
+            bad = folder / "bad.geojson"
+            bad.write_text("{not json", encoding="utf-8")
+            self.assertIn("not valid GeoJSON", check_boundary_file(str(bad)))
+            points = folder / "points.geojson"
+            points.write_text(json.dumps({"type": "Point", "coordinates": [0, 0]}), encoding="utf-8")
+            self.assertIn("no Polygon", check_boundary_file(str(points)))
+            self.assertEqual(check_boundary_file(str(folder / "missing.geojson")), "file not found")
+
+    def test_orphan_project_folders_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (storage_dir(root) / "projects" / "prj_known").mkdir(parents=True)
+            (storage_dir(root) / "projects" / "prj_orphan").mkdir(parents=True)
+            self.assertEqual(find_orphan_projects(root, {"prj_known": {}}), ["prj_orphan"])
+
+    def test_pytest_summary_parser(self):
+        text = "..F\nFAILED backend/tests/test_a.py::test_x - assert 1 == 2\n1 failed, 2 passed, 1 skipped in 3.20s\n"
+        parsed = summarize_pytest_output(text)
+        self.assertEqual(parsed["counts"], {"failed": 1, "passed": 2, "skipped": 1})
+        self.assertEqual(parsed["failed"], ["FAILED backend/tests/test_a.py::test_x"])
+        self.assertEqual(summarize_pytest_output("garbage")["counts"], {})
+
+    def test_run_tests_requires_backend_tests_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(run_tests(Path(tmp), quiet=True), 1)
+
+    def test_run_tests_reports_pass_and_fail(self):
+        if importlib.util.find_spec("pytest") is None:
+            self.skipTest("pytest not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests = root / "backend" / "tests"
+            tests.mkdir(parents=True)
+            (tests / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+            self.assertEqual(run_tests(root, quiet=True), 0)
+            (tests / "test_bad.py").write_text("def test_bad():\n    assert False\n", encoding="utf-8")
+            self.assertEqual(run_tests(root, quiet=True), 1)
+            self.assertFalse((root / ".pytest_cache").exists())
+
+    def test_vegetation_ready_with_t1_only_wetland_not_ready(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._populate(root, "prj_1", "t1")
+            result = evaluate_project(root, "prj_1", {"analysis_mode": "vegetation"})
+            self.assertEqual(result["verdicts"]["vegetation"], [])
+            self.assertTrue(any("T2" in reason for reason in result["verdicts"]["wetland"]))
+            self.assertTrue(project_ready(result))
+            wetland = evaluate_project(root, "prj_1", {"analysis_mode": "wetland"})
+            self.assertFalse(project_ready(wetland))
+
+    def test_wetland_ready_when_both_dates_complete(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._populate(root, "prj_1", "t1")
+            self._populate(root, "prj_1", "t2")
+            result = evaluate_project(root, "prj_1", {"analysis_mode": "wetland"})
+            self.assertEqual(result["verdicts"], {"vegetation": [], "wetland": []})
+            self.assertEqual(result["notes"], [])
+
+    def test_missing_band_is_listed_by_name(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._populate(root, "prj_1", "t1", bands=("scene_R.tif", "scene_G.tif"))
+            reasons = evaluate_project(root, "prj_1", {"analysis_mode": "vegetation"})["verdicts"]["vegetation"]
+            self.assertEqual(reasons, ["T1 missing scene_NIR.tif, scene_RE.tif"])
+
+    def test_missing_georeferencing_is_a_note_not_a_blocker(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._populate(root, "prj_1", "t1", georeferenced=False)
+            result = evaluate_project(root, "prj_1", {"analysis_mode": "vegetation"})
+            self.assertEqual(result["verdicts"]["vegetation"], [])
+            self.assertTrue(any("georeferencing" in note for note in result["notes"]))
+
+    def test_corrupt_and_empty_bands_block_readiness(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = self._populate(root, "prj_1", "t1")
+            (folder / "scene_R.tif").write_bytes(b"not a tiff")
+            (folder / "scene_G.tif").write_bytes(b"")
+            reasons = evaluate_project(root, "prj_1", {"analysis_mode": "vegetation"})["verdicts"]["vegetation"]
+            self.assertTrue(any("scene_R.tif" in r and "cannot be read" in r for r in reasons))
+            self.assertTrue(any("scene_G.tif" in r and "empty" in r for r in reasons))
+
+    def test_all_nodata_band_blocks_readiness(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = self._populate(root, "prj_1", "t1")
+            self._write_tif(folder / "scene_NIR.tif", fill=-9999.0)
+            reasons = evaluate_project(root, "prj_1", {"analysis_mode": "vegetation"})["verdicts"]["vegetation"]
+            self.assertTrue(any("no valid pixels" in r for r in reasons))
+
+    def test_dimension_mismatch_blocks_within_date_but_only_warns_between_dates(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = self._populate(root, "prj_1", "t1")
+            self._write_tif(folder / "scene_RE.tif", size=(20, 20))
+            reasons = evaluate_project(root, "prj_1", {"analysis_mode": "vegetation"})["verdicts"]["vegetation"]
+            self.assertTrue(any("band dimensions differ" in r for r in reasons))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._populate(root, "prj_1", "t1", size=(16, 16))
+            self._populate(root, "prj_1", "t2", size=(24, 24))
+            result = evaluate_project(root, "prj_1", {"analysis_mode": "wetland"})
+            self.assertEqual(result["verdicts"]["wetland"], [])
+            self.assertTrue(any("T1 and T2 dimensions differ" in note for note in result["notes"]))
+
+    def test_readiness_report_levels_and_strict_exit_code(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = projects_file(root)
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({
+                "prj_ok": {"analysis_mode": "vegetation"},
+                "prj_partial": {"analysis_mode": "wetland"},
+            }), encoding="utf-8")
+            self._populate(root, "prj_ok", "t1")
+            self._populate(root, "prj_partial", "t1")
+            (storage_dir(root) / "projects" / "prj_stray").mkdir()
+            report = Report(quiet=True)
+            results = check_readiness(root, report)
+            self.assertEqual([project_ready(r) for r in results], [True, False])
+            self.assertEqual(report.counts["FAIL"], 0)
+            self.assertGreaterEqual(report.counts["WARN"], 2)  # not ready + orphan folder
+            self.assertEqual(run_readiness(root, quiet=True), 0)
+            self.assertEqual(run_readiness(root, strict=True, quiet=True), 1)
+            self.assertEqual(run_readiness(root, only="prj_ok", strict=True, quiet=True), 0)
+            self.assertEqual(run_readiness(root, only="nope", quiet=True), 1)
+
+    def test_readiness_does_not_modify_project_data(self):
+        self._require_rasterio()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = projects_file(root)
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"prj_1": {"t1_dir": "C:\\old\\place"}}), encoding="utf-8")
+            before = config.read_text(encoding="utf-8")
+            run_readiness(root, quiet=True)
+            self.assertEqual(config.read_text(encoding="utf-8"), before)
+            self.assertEqual(list(config.parent.glob("projects.json.backup-*")), [])
+
+
 def self_test() -> int:
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTests)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -748,15 +1388,31 @@ def main() -> int:
     actions.add_argument("--fix-paths", action="store_true", help="Backup and repair projects.json and upload directories")
     actions.add_argument("--fix-model", action="store_true", help="Backup and repair ONLY the bundled 1x1 Conv demo ONNX model")
     actions.add_argument("--check", action="store_true", help="Read-only environment validation")
+    actions.add_argument("--readiness", action="store_true", help="Read-only: is each saved project ready for vegetation / wetland analysis?")
+    actions.add_argument("--run-tests", action="store_true", help="Run the existing backend pytest suite with this interpreter")
+    actions.add_argument("--verify", action="store_true", help="Run --check --deep-model, --readiness and --run-tests in one command")
     actions.add_argument("--self-test", action="store_true", help="Run embedded regression tests")
     parser.add_argument("--deep-model", action="store_true", help="Also run tiny ONNX CPU smoke inference during --check")
+    parser.add_argument("--recreate", action="store_true", help="With --setup: delete and rebuild .venv (also needed when it uses an unsupported Python)")
+    parser.add_argument("--project", metavar="ID", help="With --readiness: assess only this project")
+    parser.add_argument("--strict", action="store_true", help="With --readiness: exit with code 1 if any project is not ready")
+    parser.add_argument("--include-engine", action="store_true", help="With --run-tests/--verify: also run backend/Engine_module tests")
+    parser.add_argument("--test-timeout", type=int, default=1200, metavar="SECONDS", help="With --run-tests/--verify: per-suite time limit (default 1200)")
     args = parser.parse_args()
     if args.deep_model and not args.check:
         parser.error("--deep-model requires --check")
+    if args.recreate and not args.setup:
+        parser.error("--recreate requires --setup")
+    if (args.project or args.strict) and not args.readiness:
+        parser.error("--project and --strict require --readiness")
+    if args.include_engine and not (args.run_tests or args.verify):
+        parser.error("--include-engine requires --run-tests or --verify")
+    if args.test_timeout < 1:
+        parser.error("--test-timeout must be at least 1 second")
     if args.self_test:
         return self_test()
     if args.setup:
-        return setup()
+        return setup(recreate=args.recreate)
     if args.fix_paths:
         report = Report()
         success = fix_project_paths(ROOT, report)
@@ -765,6 +1421,12 @@ def main() -> int:
         report = Report()
         success = repair_generated_model(model_path(ROOT), report)
         return 0 if success and report.summary() else 1
+    if args.readiness:
+        return run_readiness(ROOT, only=args.project, strict=args.strict)
+    if args.run_tests:
+        return run_tests(ROOT, args.include_engine, args.test_timeout)
+    if args.verify:
+        return run_verify(args.include_engine, args.test_timeout)
     return run_check(args.deep_model)
 
 

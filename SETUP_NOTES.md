@@ -6,11 +6,74 @@ This is a self-contained development-environment improvement for the **GIS Wetla
 
 | File | Responsibility |
 | --- | --- |
-| `environment.py` | Python virtual environment bootstrap, configuration-path migration, dependency, raster and ONNX validation, and embedded regression tests |
+| `environment.py` | Python virtual environment bootstrap, configuration-path migration, dependency, raster and ONNX validation, project readiness checks, a runner for the existing tests, and embedded regression tests |
 | `requirements.txt` | Windows/Python 3.11 dependency baseline for the FastAPI/GIS runtime and existing Python tests |
 | `SETUP_NOTES.md` | Setup instructions, testing, assumptions, limits and PR scope |
 
 No existing `backend/` Python source file needs to be edited for this initial improvement.
+
+## What's new in this update
+
+This update extends the same three files. No existing `backend/` or `frontend/` source file is changed.
+
+### New commands
+
+Run these with the project's virtual environment, for example `.\.venv\Scripts\python.exe environment.py --readiness`.
+
+| Command | What it does |
+| --- | --- |
+| `--readiness` | Read-only. Reports **READY** or **NOT READY** for each saved project in vegetation and wetland mode and names exactly what is missing or wrong. |
+| `--readiness --project ID` | Same, for one project. |
+| `--readiness --strict` | Exit code 1 if any project is not ready (useful in scripts). |
+| `--run-tests` | Runs the existing `backend/tests` suite with this interpreter and prints a compact result with the names of failing tests. Add `--include-engine` to also run the `backend/Engine_module` tests and `--test-timeout N` to change the per-suite limit (default 1200 s). |
+| `--verify` | One command: `--check --deep-model`, then `--readiness`, then `--run-tests`, followed by a combined summary. |
+| `--setup --recreate` | Deletes and rebuilds `.venv`. Required when the existing `.venv` was built with an unsupported Python. |
+
+### Project readiness rules
+
+The rules mirror the existing dataset validation tests (`test_dataset_validation_modes.py`). **Vegetation** mode needs the four bands at T1. **Wetland** mode needs the four bands at both T1 and T2. The mode checked is the project's `analysis_mode`; when it is not set, both modes are shown. The wetland boundary is optional in both modes.
+
+| Finding | Effect |
+| --- | --- |
+| A band file is missing (`scene_R`, `scene_G`, `scene_NIR`, `scene_RE`) | Blocks every mode that needs that date |
+| A band file is empty, corrupt, unreadable, has no pixels, or contains only NoData | Blocks |
+| Bands of one date have different dimensions | Blocks (the channels cannot be stacked) |
+| A band has no CRS or no geotransform | Note only. The existing identical-input test treats an undefined CRS as valid drone imagery |
+| T1 and T2 have different dimensions or CRS | Note only. The engine has its own alignment step |
+| Wetland boundary missing, unreadable or without a polygon | Note only. The boundary is optional |
+| An upload folder exists with no matching project in `projects.json` | Warning |
+
+The check only reads files. It does not call the backend's `/datasets/validate` endpoint on purpose: according to the existing tests that endpoint changes the project status to `STAGED` and falls back to the sample scene when nothing was uploaded, which would hide a missing dataset.
+
+### Edge cases now handled
+
+| Case | Behaviour |
+| --- | --- |
+| Band files named `scene_R.TIF` or `scene_R.tiff` | Found (case-insensitive) |
+| Empty or whitespace-only `projects.json` | Clear FAIL message; the file is not touched |
+| Repository path with spaces (for example `C:\Users\Anjan P Manoj\...`) | Covered by a self-test |
+| `.venv` created with an unsupported Python, or whose interpreter is missing | `--setup` stops before changing any file and says to use `--setup --recreate`; the folder is never deleted unless it contains `pyvenv.cfg` |
+| Unsupported Python running `--setup` | Message names the supported range and shows the `py -3.11` command |
+| `pip install` fails (offline, proxy, no wheel) | Message with the pip exit code and what to check |
+| Non-UTF-8 pytest output on Windows | Output is decoded safely |
+| Tests hang | Per-suite timeout |
+| `.pytest_cache` clutter | Not created by `--run-tests` |
+
+### Verification
+
+- `--self-test` now contains 30 tests (the 11 from the first version plus 19 new ones covering the rules and edge cases above).
+- The new commands were also run end to end in a Linux sandbox against a synthetic repository (paths with spaces, six projects in different states, a corrupt project, an orphan folder, a stale `.venv`). `--readiness` left `projects.json` byte-for-byte unchanged.
+- Windows results for this update are listed in the pull request description.
+
+### Notes on the existing tests
+
+- `--run-tests` runs the real backend tests. They create and delete projects in the real `backend/storage`, so run them on a development copy. The end-to-end test can take a minute.
+- `backend/tests/test_fastapi_server.py::test_real_tiff_upload_and_validation` reads files from `C:\Users\HP\Desktop` and returns early when they are missing, so it reports as passed on any other machine without testing anything. It is not changed in this PR.
+
+### Assumptions to confirm with the team
+
+1. The project record key is `analysis_mode` with the values `vegetation` and `wetland`.
+2. The readiness rules above match what the backend accepts, especially "no CRS is allowed" and "T1/T2 mismatch is not blocking".
 
 ## Prerequisites
 
@@ -96,6 +159,7 @@ Those are results from the **previous local working copy**, not a guarantee abou
 - A repaired ONNX demo file remains an untrained, simplified model. This is an environment-compatibility workaround and not evidence of production scientific accuracy.
 - Some auxiliary scripts (`torch` / `segmentation_models_pytorch` model export, specialized validation scripts) may need additional optional packages; they are outside the supported backend/test baseline here.
 - `ProjectStore` concurrency and simultaneous project writes are not addressed by this utility; no backend source change is included.
+- Readiness is a file-level check. It does not prove that a run will succeed, and it does not replace the backend's own validation.
 - A fresh repository may contain old project records without their underlying raster datasets. The tool fixes file-system paths, not missing source data.
 
 ## Pull request and Git hygiene
@@ -120,4 +184,8 @@ The `--setup` process is expected to produce local files; these are **not** part
 - [ ] Detect/repair only the known incompatible generated ONNX demo file and verify runtime load.
 - [ ] Report meaningful PASS/WARN/FAIL outcomes and pass embedded self-tests.
 - [ ] Start the FastAPI backend and verify `/api/health`.
+- [ ] `--readiness` names the missing bands or problems for each saved project and leaves `projects.json` unchanged.
+- [ ] `--run-tests` runs the existing backend tests and reports passing and failing tests.
+- [ ] `--verify` runs the check, readiness and tests in one command.
+- [ ] `--setup` stops cleanly on a stale `.venv` and rebuilds it with `--recreate`.
 - [ ] Submit a clean feature branch containing only the three intended files.
